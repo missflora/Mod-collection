@@ -1,14 +1,20 @@
+import base64
 import os
 import sqlite3
 from datetime import date
+
+import anthropic
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters,
 )
 
-BOT_TOKEN  = os.environ["BOT_TOKEN"]
-DAILY_GOAL = 1400
+BOT_TOKEN       = os.environ["BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+DAILY_GOAL      = 1400
+
+_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 PRESETS = [
     {"name": "Protein Shake",       "cal": 150, "protein": 25, "carbs": 8,  "fat": 3},
@@ -22,6 +28,8 @@ PRESETS = [
     {"name": "Boiled Chicken",      "cal": 165, "protein": 31, "carbs": 0,  "fat": 4},
     {"name": "Wonton Soup",         "cal": 180, "protein": 12, "carbs": 20, "fat": 5},
     {"name": "Green Tea",           "cal": 0,   "protein": 0,  "carbs": 0,  "fat": 0},
+    {"name": "Fruit Fibre Shake",   "cal": 285, "protein": 5,  "carbs": 55, "fat": 4},
+    {"name": "Scallion Pancake",    "cal": 270, "protein": 5,  "carbs": 35, "fat": 12},
 ]
 
 
@@ -118,7 +126,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/quick — quick-add from presets\n"
         "/reset — clear today's log\n"
         "/help — show this message\n\n"
-        "Or just send: `150 protein shake`",
+        "Or just send: `150 protein shake`\n"
+        "📸 Send a photo — I'll estimate the calories automatically",
         parse_mode="Markdown",
     )
 
@@ -178,6 +187,67 @@ async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+_PHOTO_PROMPT = (
+    "You are a nutrition expert. Analyze this food photo and estimate the calories and macros. "
+    "Reply ONLY in this exact format with no other text:\n"
+    "Food: <name>\n"
+    "Calories: <number>\n"
+    "Protein: <number>g\n"
+    "Carbs: <number>g\n"
+    "Fat: <number>g\n"
+    "Note: <one sentence confidence note>"
+)
+
+
+async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Analysing your photo…")
+
+    photo_file = await (await ctx.bot.get_file(update.message.photo[-1].file_id)).download_as_bytearray()
+    image_b64 = base64.standard_b64encode(bytes(photo_file)).decode()
+
+    try:
+        response = _anthropic.messages.create(
+            model="claude-3-5-haiku-20241022",
+            max_tokens=256,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
+                    {"type": "text", "text": _PHOTO_PROMPT},
+                ],
+            }],
+        )
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Vision API error: {e}")
+        return
+
+    raw = response.content[0].text.strip()
+    parsed = {k.strip(): v.strip() for line in raw.splitlines() if ":" in line
+              for k, v in [line.split(":", 1)]}
+
+    try:
+        food_name = parsed["Food"]
+        cal     = float(parsed["Calories"])
+        protein = float(parsed["Protein"].replace("g", ""))
+        carbs   = float(parsed["Carbs"].replace("g", ""))
+        fat     = float(parsed["Fat"].replace("g", ""))
+        note    = parsed.get("Note", "")
+    except (KeyError, ValueError):
+        await update.message.reply_text(
+            "⚠️ Couldn't read the nutrition data from the photo. Try a clearer image."
+        )
+        return
+
+    insert_entry(update.effective_user.id, food_name, cal, protein, carbs, fat)
+    await update.message.reply_text(
+        f"📸 *{food_name}* — {cal:.0f} kcal\n"
+        f"Protein: {protein:.0f}g  Carbs: {carbs:.0f}g  Fat: {fat:.0f}g\n"
+        f"_{note}_\n\n"
+        + summary_text(update.effective_user.id),
+        parse_mode="Markdown",
+    )
+
+
 async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _parse_and_add(update, update.message.text.strip())
 
@@ -227,6 +297,7 @@ def main():
     app.add_handler(CommandHandler("reset",  cmd_reset))
     app.add_handler(MessageHandler(filters.Regex(r"^/del\d+$"), cmd_del))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     print("Bot running...")
     app.run_polling()
